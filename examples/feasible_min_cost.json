@@ -1,0 +1,97 @@
+{
+  "rows": 2,
+  "cols": 2,
+  "entrance": { "x": 0.5, "y": 0 },
+  "must_reach": [
+    { "x": 0.5, "y": 1.5 },
+    { "x": 1.5, "y": 1.5 }
+  ],
+  "panels": {
+    "P-TL-STD": {
+      "id": "P-TL-STD",
+      "price": 120,
+      "nodes": [
+        { "id": "n1", "position": { "x": 0.5, "y": 0 }, "is_connector": true },
+        { "id": "n2", "position": { "x": 0.5, "y": 1 }, "is_connector": true },
+        { "id": "n3", "position": { "x": 1, "y": 0.5 }, "is_connector": true }
+      ],
+      "links": [
+        { "a": "n1", "b": "n2" },
+        { "a": "n2", "b": "n3" }
+      ],
+      "point_ids": []
+    },
+    "P-TL-PREMIUM": {
+      "id": "P-TL-PREMIUM",
+      "price": 180,
+      "nodes": [
+        { "id": "n1", "position": { "x": 0.5, "y": 0 }, "is_connector": true },
+        { "id": "n2", "position": { "x": 0.5, "y": 1 }, "is_connector": true },
+        { "id": "n3", "position": { "x": 1, "y": 0.5 }, "is_connector": true },
+        { "id": "n4", "position": { "x": 0.2, "y": 0.2 }, "is_connector": false }
+      ],
+      "links": [
+        { "a": "n1", "b": "n2" },
+        { "a": "n2", "b": "n3" },
+        { "a": "n1", "b": "n4" }
+      ],
+      "point_ids": []
+    },
+    "P-TR": {
+      "id": "P-TR",
+      "price": 100,
+      "nodes": [
+        { "id": "n1", "position": { "x": 0, "y": 0.5 }, "is_connector": true },
+        { "id": "n2", "position": { "x": 0.5, "y": 1 }, "is_connector": true }
+      ],
+      "links": [{ "a": "n1", "b": "n2" }],
+      "point_ids": []
+    },
+    "P-BL": {
+      "id": "P-BL",
+      "price": 110,
+      "nodes": [
+        { "id": "n1", "position": { "x": 0.5, "y": 0 }, "is_connector": true },
+        { "id": "n3", "position": { "x": 1, "y": 0.5 }, "is_connector": true },
+        { "id": "n4", "position": { "x": 0.5, "y": 0.5 }, "is_connector": false }
+      ],
+      "links": [
+        { "a": "n1", "b": "n3" },
+        { "a": "n1", "b": "n4" }
+      ],
+      "point_ids": ["n4"]
+    },
+    "P-BR": {
+      "id": "P-BR",
+      "price": 130,
+      "nodes": [
+        { "id": "n1", "position": { "x": 0, "y": 0.5 }, "is_connector": true },
+        { "id": "n2", "position": { "x": 0.5, "y": 0 }, "is_connector": true },
+        { "id": "n3", "position": { "x": 0.5, "y": 0.5 }, "is_connector": false }
+      ],
+      "links": [
+        { "a": "n1", "b": "n2" },
+        { "a": "n1", "b": "n3" }
+      ],
+      "point_ids": ["n3"]
+    }
+  },
+  "cells": [
+    {
+      "row": 0, "col": 0, "must_replace": true,
+      "candidates": ["P-TL-PREMIUM", "P-TL-STD"]
+    },
+    {
+      "row": 0, "col": 1, "must_replace": true,
+      "candidates": ["P-TR"]
+    },
+    {
+      "row": 1, "col": 0, "must_replace": false,
+      "candidates": [], "old_panel": "P-BL"
+    },
+    {
+      "row": 1, "col": 1, "must_replace": true,
+      "candidates": ["P-BR"]
+    }
+  ]
+}

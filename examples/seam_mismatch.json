@@ -1,0 +1,41 @@
+{
+  "rows": 1,
+  "cols": 2,
+  "entrance": { "x": 0.5, "y": 0 },
+  "must_reach": [{ "x": 1.5, "y": 0.5 }],
+  "panels": {
+    "P-A": {
+      "id": "P-A",
+      "price": 100,
+      "nodes": [
+        { "id": "top", "position": { "x": 0.5, "y": 0 }, "is_connector": true },
+        { "id": "right", "position": { "x": 1, "y": 0.5 }, "is_connector": true },
+        { "id": "p", "position": { "x": 0.3, "y": 0.7 }, "is_connector": false }
+      ],
+      "links": [
+        { "a": "top", "b": "right" },
+        { "a": "right", "b": "p" }
+      ],
+      "point_ids": ["p"]
+    },
+    "P-B-MISMATCH": {
+      "id": "P-B-MISMATCH",
+      "price": 90,
+      "nodes": [
+        { "id": "p", "position": { "x": 0.5, "y": 0.5 }, "is_connector": false }
+      ],
+      "links": [],
+      "point_ids": ["p"]
+    }
+  },
+  "cells": [
+    {
+      "row": 0, "col": 0, "must_replace": true,
+      "candidates": ["P-A"]
+    },
+    {
+      "row": 0, "col": 1, "must_replace": true,
+      "candidates": ["P-B-MISMATCH"]
+    }
+  ]
+}
