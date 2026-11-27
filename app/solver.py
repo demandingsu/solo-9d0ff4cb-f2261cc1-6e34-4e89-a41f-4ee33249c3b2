@@ -1,4 +1,4 @@
-"""换板组合求解器。
+"""换板组合求解器（支持一次算完与分批续算）。
 
 思路
 ====
@@ -12,10 +12,17 @@
 4. 连通性：用可回滚并查集（DSU）增量合并板内连线与接缝接头，
    完整拼好后检查每个必达展点是否与入口同一连通分量。
 5. 费用下界剪枝：当前累计费用已不低于已知最优解时直接剪枝。
-"""
 
+分批续算
+========
+回溯被改写为显式栈（``_Frame``），每“试放”一个格子的一个候选板就是
+一次 attempt：候选即使当场被剪枝也计入次数。``run_batch(max_attempts)``
+只推进指定次数就停下，栈、DSU、已选板等状态原样留在 ``Solver`` 实例里；
+下次续算从 ``next_option`` 继续，已经试过的候选不会被再次尝试。
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .models import EPS, SolveRequest
@@ -82,6 +89,33 @@ class _Reason:
             self.text = text
 
 
+@dataclass
+class _Placement:
+    """某一格当前选中的板，供回溯时撤销。"""
+
+    r: int
+    c: int
+    connectors: dict[tuple[float, float], str]
+    checkpoint: int
+
+
+@dataclass
+class _Frame:
+    """回溯栈的一层：某一格的全部候选与下一个待试下标。"""
+
+    idx: int
+    spent_before: float
+    options: list[tuple[str, float, str]]
+    next_option: int = 0
+    incoming: Optional[_Placement] = field(default=None)
+
+    def has_pending(self) -> bool:
+        return self.next_option < len(self.options)
+
+    def pending_count(self) -> int:
+        return max(0, len(self.options) - self.next_option)
+
+
 class Solver:
     def __init__(self, req: SolveRequest) -> None:
         self.req = req
@@ -89,7 +123,13 @@ class Solver:
         self.cell_at: dict[tuple[int, int], object] = {
             (c.row, c.col): c for c in req.cells
         }
+        self.order: list[tuple[int, int]] = [
+            (r, c) for r in range(self.rows) for c in range(self.cols)
+        ]
         self.dsu = _RollbackDSU()
+        self._placed_connectors: dict[tuple[int, int], dict] = {}
+        self._coord_to_node: dict[tuple, list] = {}
+
         self.best_cost: Optional[float] = None
         self.best_choices: Optional[list[str]] = None
         # 最后一个走到叶节点的完整组合（可能因不可达而失败），
@@ -105,14 +145,32 @@ class Solver:
             "pruned_by_missing_point": 0,
             "pruned_by_unreachable": 0,
         }
+
+        # 每格候选（按 id 排序，保证同价时结果确定）及“本格之后的最小费用”。
+        self._options_by_idx: list[list[tuple[str, float, str]]] = []
+        for r, c in self.order:
+            self._options_by_idx.append(self._options_for(self.cell_at[(r, c)]))
+        n = len(self.order)
+        self._min_remaining = [0.0] * (n + 1)
+        for idx in range(n - 1, -1, -1):
+            cheapest = min(
+                (price for _pid, price, _src in self._options_by_idx[idx]),
+                default=0.0,
+            )
+            self._min_remaining[idx] = cheapest + self._min_remaining[idx + 1]
+
         # 每个必达展点归属的格子与应匹配的局部坐标。
         self.points_by_cell: dict[tuple[int, int], list[tuple[float, float]]] = {}
         for p in req.must_reach:
             r, c, lx, ly = self._global_to_cell(p.x, p.y)
-            self.points_by_cell.setdefault((r, c), []).append(
-                (_q(lx), _q(ly))
-            )
+            self.points_by_cell.setdefault((r, c), []).append((_q(lx), _q(ly)))
         self.entrance_cell, self.entrance_local = self._entrance_target()
+
+        # 分批续算状态。
+        self._stack: list[_Frame] = []
+        self._chosen: list[str] = []
+        self._started = False
+        self.total_attempts = 0
 
     # ------------------------------------------------------------------ 坐标
     def _global_to_cell(self, gx: float, gy: float) -> tuple[int, int, float, float]:
@@ -167,9 +225,7 @@ class Solver:
         return opts
 
     # ------------------------------------------------------------ 约束检查
-    def _check_points(
-        self, r: int, c: int, panel
-    ) -> Optional[str]:
+    def _check_points(self, r: int, c: int, panel) -> Optional[str]:
         needed = self.points_by_cell.get((r, c), [])
         if not needed:
             return None
@@ -278,17 +334,121 @@ class Solver:
             bucket.append(me)
         self._placed_connectors[(r, c)] = connectors
 
-    # ------------------------------------------------------------------ 回溯
-    def solve(self) -> dict:
-        self._placed_connectors: dict[tuple[int, int], dict] = {}
-        self._coord_to_node: dict[tuple, list] = {}
-        order = [
-            (r, c)
-            for r in range(self.rows)
-            for c in range(self.cols)
-        ]
-        self._dfs(order, 0, [], 0.0)
+    def _undo_placement(self, placement: _Placement) -> None:
+        """撤销某格选板：弹出已选板、移除接头登记、回滚 DSU。"""
+        r, c = placement.r, placement.c
+        self._chosen.pop()
+        self._placed_connectors.pop((r, c), None)
+        for lx, ly in placement.connectors:
+            gkey = self._global_key(r, c, lx, ly)
+            bucket = self._coord_to_node.get(gkey)
+            if bucket is None:
+                continue
+            bucket = [k for k in bucket if (k[0], k[1]) != (r, c)]
+            if bucket:
+                self._coord_to_node[gkey] = bucket
+            else:
+                del self._coord_to_node[gkey]
+        self.dsu.rollback(placement.checkpoint)
 
+    # ------------------------------------------------------------ 分批回溯
+    def _ensure_started(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        root = _Frame(
+            idx=0,
+            spent_before=0.0,
+            options=self._options_by_idx[0],
+        )
+        self.stats["partial_combinations_visited"] += 1
+        self._stack.append(root)
+        self._settle()
+
+    def _settle(self) -> None:
+        """弹掉已无候选的层，并撤销这些层带入的选板。
+
+        结束后栈要么为空（搜索完成），要么栈顶仍有待试候选。
+        """
+        while self._stack and not self._stack[-1].has_pending():
+            frame = self._stack.pop()
+            if frame.incoming is not None:
+                self._undo_placement(frame.incoming)
+
+    def _try_next_option(self) -> None:
+        """试放栈顶格子的下一个候选；无论成败都恰好消耗一次 attempt。"""
+        frame = self._stack[-1]
+        assert frame.has_pending(), "调用前应保证栈顶仍有待试候选"
+        r, c = self.order[frame.idx]
+        pid, price, _src = frame.options[frame.next_option]
+        # 先前进下标：即使本批结束或异常，该候选也不会被再次尝试。
+        frame.next_option += 1
+        self.total_attempts += 1
+        spent = frame.spent_before + price
+
+        if self.best_cost is not None and spent >= self.best_cost - EPS:
+            self.stats["pruned_by_cost_bound"] += 1
+            return
+
+        panel = self.req.panels[pid]
+        connectors = self._panel_connectors(panel)
+
+        point_err = self._check_points(r, c, panel)
+        if point_err:
+            self.stats["pruned_by_missing_point"] += 1
+            self.reason.note(frame.idx, point_err)
+            return
+
+        edge_err = self._check_edges(r, c, panel, connectors)
+        if edge_err:
+            if "外缘" in edge_err or "入口" in edge_err:
+                self.stats["pruned_by_outer_edge"] += 1
+            else:
+                self.stats["pruned_by_seam_mismatch"] += 1
+            self.reason.note(frame.idx, edge_err)
+            return
+
+        checkpoint = self.dsu.checkpoint()
+        self._place(r, c, panel, connectors)
+        self._chosen.append(pid)
+        placement = _Placement(r, c, connectors, checkpoint)
+
+        if frame.idx == len(self.order) - 1:
+            # 最后一格：落板后立即检查连通性。
+            self.stats["complete_combinations_evaluated"] += 1
+            self._evaluate_leaf(self._chosen, spent)
+            self._undo_placement(placement)
+            return
+
+        next_idx = frame.idx + 1
+        child = _Frame(
+            idx=next_idx,
+            spent_before=spent,
+            options=self._options_by_idx[next_idx],
+            incoming=placement,
+        )
+        self.stats["partial_combinations_visited"] += 1
+        self._stack.append(child)
+
+    def run_batch(self, max_attempts: int) -> int:
+        """推进至多 ``max_attempts`` 次试放，返回本批实际次数。"""
+        self._ensure_started()
+        used = 0
+        while used < max_attempts and self._stack:
+            self._try_next_option()
+            used += 1
+            self._settle()
+        return used
+
+    def solve(self) -> dict:
+        """一次算完（等价于不限次数的分批推进）。"""
+        self._ensure_started()
+        while self._stack:
+            self._try_next_option()
+            self._settle()
+        return self.result()
+
+    def result(self) -> dict:
         if self.best_choices is None:
             return {
                 "feasible": False,
@@ -303,65 +463,33 @@ class Solver:
             "stats": self.stats,
         }
 
-    def _dfs(
-        self,
-        order: list[tuple[int, int]],
-        idx: int,
-        chosen: list[str],
-        spent: float,
-    ) -> None:
-        if self.best_cost is not None and spent >= self.best_cost - EPS:
-            self.stats["pruned_by_cost_bound"] += 1
-            return
-        if idx == len(order):
-            self.stats["complete_combinations_evaluated"] += 1
-            self._evaluate_leaf(chosen, spent)
-            return
+    # ------------------------------------------------------------ 分批视图
+    @property
+    def done(self) -> bool:
+        self._ensure_started()
+        return not self._stack
 
-        r, c = order[idx]
-        cell = self.cell_at[(r, c)]
-        self.stats["partial_combinations_visited"] += 1
+    @property
+    def pending_branches(self) -> int:
+        self._ensure_started()
+        return sum(frame.pending_count() for frame in self._stack)
 
-        for pid, price, _src in self._options_for(cell):
-            if spent + price >= (self.best_cost or float("inf")) - EPS:
-                self.stats["pruned_by_cost_bound"] += 1
-                continue
-            panel = self.req.panels[pid]
-            connectors = self._panel_connectors(panel)
+    def lower_bound(self) -> Optional[float]:
+        """所有待查分支费用下界中的最低值。
 
-            point_err = self._check_points(r, c, panel)
-            if point_err:
-                self.stats["pruned_by_missing_point"] += 1
-                self.reason.note(idx, point_err)
-                continue
-
-            edge_err = self._check_edges(r, c, panel, connectors)
-            if edge_err:
-                if "外缘" in edge_err or "入口" in edge_err:
-                    self.stats["pruned_by_outer_edge"] += 1
-                else:
-                    self.stats["pruned_by_seam_mismatch"] += 1
-                self.reason.note(idx, edge_err)
-                continue
-
-            cp = self.dsu.checkpoint()
-            self._place(r, c, panel, connectors)
-            chosen.append(pid)
-            self._dfs(order, idx + 1, chosen, spent + price)
-            chosen.pop()
-            del self._placed_connectors[(r, c)]
-            # 清理本格登记的全部全局坐标接头（含角部）。
-            for lx, ly in connectors:
-                gkey = self._global_key(r, c, lx, ly)
-                bucket = self._coord_to_node.get(gkey)
-                if bucket is None:
-                    continue
-                bucket = [k for k in bucket if (k[0], k[1]) != (r, c)]
-                if bucket:
-                    self._coord_to_node[gkey] = bucket
-                else:
-                    del self._coord_to_node[gkey]
-            self.dsu.rollback(cp)
+        每个分支下界 = 已选板费用 + 下一块待试板费用 +
+        其后各格可能的最低费用（旧板为 0），因而不会高于该分支
+        任何真实可行方案的价格。
+        """
+        self._ensure_started()
+        best_lb: Optional[float] = None
+        for frame in self._stack:
+            remaining = self._min_remaining[frame.idx + 1]
+            for _pid, price, _src in frame.options[frame.next_option:]:
+                bound = frame.spent_before + price + remaining
+                if best_lb is None or bound < best_lb:
+                    best_lb = bound
+        return best_lb
 
     def _evaluate_leaf(self, chosen: list[str], spent: float) -> None:
         """完整方案的入口-展点连通性检查。"""

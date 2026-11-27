@@ -277,3 +277,110 @@ class SolveResponse(BaseModel):
         default_factory=dict,
         description="求解过程统计：完整组合数、各类剪枝次数等",
     )
+
+
+# --------------------------------------------------------------------------
+# 分批续算
+# --------------------------------------------------------------------------
+MAX_BATCH_ATTEMPTS = 100_000
+
+
+class BatchRequest(SolveRequest):
+    """发起分批搜索：原试算输入 + 本批最多试放次数。"""
+
+    max_attempts: int = Field(
+        ...,
+        ge=1,
+        le=MAX_BATCH_ATTEMPTS,
+        description=(
+            "本批最多允许的试放次数；每个格子的每个候选（含被剪枝淘汰的）"
+            "都计 1 次。"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "summary": "发起：可行样例，每批只试放 1 个候选",
+                    "value": dict(
+                        _load_example("feasible_min_cost"), max_attempts=1
+                    ),
+                },
+                {
+                    "summary": "发起：不可行样例，每批只试放 1 个候选",
+                    "value": dict(
+                        _load_example("unreachable_point"), max_attempts=1
+                    ),
+                },
+            ]
+        }
+    }
+
+
+class ResumeRequest(BaseModel):
+    """凭搜索编号续算：本批最多试放次数。"""
+
+    max_attempts: int = Field(
+        ...,
+        ge=1,
+        le=MAX_BATCH_ATTEMPTS,
+        description="本批最多允许的试放次数（续算时每个分支的每个候选只试一次）。",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "summary": "续算：每批只试放 1 个选择",
+                    "value": {"max_attempts": 1},
+                }
+            ]
+        }
+    }
+
+
+class BatchPlan(BaseModel):
+    """当前已知的最低可行方案摘要。"""
+
+    total_cost: float
+    plan: list[CellPlan]
+
+
+class BatchResponse(BaseModel):
+    """一批搜索的结果。"""
+
+    search_id: str = Field(..., description="同一服务进程内续算用的编号")
+    batch_index: int = Field(..., description="从 1 起的批次序号")
+    status: Literal["searching", "optimal", "infeasible"] = Field(
+        ...,
+        description=(
+            "searching=仍在试算；optimal=已证最低价；infeasible=已证无解"
+        ),
+    )
+    attempts_used: int = Field(
+        ..., description="本批实际试放次数（含被淘汰的候选，不超过 max_attempts）"
+    )
+    pending_branches: int = Field(
+        ..., description="本批结束后仍待查的候选分支数；0 表示搜索已结束"
+    )
+    attempted_total: int = Field(..., description="自发起以来累计试放次数")
+    current_min_cost: Optional[float] = Field(
+        default=None, description="找到可行方案时，当前已知的最低总价"
+    )
+    best_plan: Optional[BatchPlan] = Field(
+        default=None, description="找到可行方案时，当前最低价对应的用板方案"
+    )
+    cost_lower_bound: Optional[float] = Field(
+        default=None,
+        description=(
+            "仍有待查分支时，各分支费用下界中的最低值；"
+            "每个下界至少计入已选板与下一块待试板的费用。搜索结束后为 null。"
+        ),
+    )
+    reason: Optional[str] = Field(
+        default=None, description="已证无解时的首要原因"
+    )
+    entrance: Position
+    must_reach: list[Position] = Field(default_factory=list)
+

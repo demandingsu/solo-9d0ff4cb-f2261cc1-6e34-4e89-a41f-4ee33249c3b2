@@ -1,125 +1,143 @@
-"""FastAPI 入口：换板试算接口与 /docs 文档。"""
+"""FastAPI 入口：一次算完接口、分批续算接口与 /docs 文档。"""
 
 from __future__ import annotations
 
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from .models import (
-    CellPlan,
-    ChosenPanel,
-    GlobalLink,
-    GlobalNode,
-    Position,
+    BatchPlan,
+    BatchRequest,
+    BatchResponse,
+    ResumeRequest,
     SolveRequest,
     SolveResponse,
 )
-from .solver import COORD_QUANTUM, Solver
+from .reporting import build_plan, reachable_points
+from .solver import Solver
 
 app = FastAPI(
     title="触摸导览图换板试算服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "录入 3 行 4 列以内的导览图、必换位置、指定入口与必达展点，"
         "在满足接缝接头逐一对齐、外缘仅留入口、入口可达全部必达展点的前提下，"
         "求更换费最低的逐格用板方案。\n\n"
-        "在本页下方 `/api/solve` 中可直接用示例请求试算。"
+        "**一次算完**：`POST /api/solve`。\n\n"
+        "**分批续算**（适合边算边看）：先用原试算输入调用 "
+        "`POST /api/batch/start` 发起，拿到 `search_id`；"
+        "之后反复调用 `POST /api/batch/{search_id}` 续算，"
+        "每次传入本批最多试放次数。被淘汰的候选也计数，"
+        "每批返回实际次数、当前最低价与用板方案、待查分支的费用下界。"
+        "状态区分 `searching`（仍在试算）、`optimal`（已证最低价）、"
+        "`infeasible`（已证无解）。\n\n"
+        "演示每批只试一个选择：两个接口的请求示例中 `max_attempts` 均为 1，"
+        "发起后把返回的 `search_id` 填入续算路径即可逐步查看。"
     ),
 )
 
-
-def _round_pos(x: float, y: float) -> Position:
-    return Position(x=round(x, COORD_QUANTUM), y=round(y, COORD_QUANTUM))
-
-
-def _build_plan(req: SolveRequest, choices: list[str]) -> list[CellPlan]:
-    plan: list[CellPlan] = []
-    for r in range(req.rows):
-        for c in range(req.cols):
-            idx = r * req.cols + c
-            pid = choices[idx]
-            cell = next(
-                cell for cell in req.cells if cell.row == r and cell.col == c
-            )
-            panel = req.panels[pid]
-            is_old = (not cell.must_replace) and pid == cell.old_panel
-            nodes = [
-                GlobalNode(
-                    cell_row=r,
-                    cell_col=c,
-                    local_id=n.id,
-                    global_position=_round_pos(c + n.position.x, r + n.position.y),
-                    is_connector=n.is_connector,
-                    is_point=n.id in panel.point_ids,
-                )
-                for n in panel.nodes
-            ]
-            links = [GlobalLink(a_local_id=lk.a, b_local_id=lk.b) for lk in panel.links]
-            plan.append(
-                CellPlan(
-                    row=r,
-                    col=c,
-                    panel_id=pid,
-                    choice="old" if is_old else "spare",
-                    price=0.0 if is_old else panel.price,
-                    nodes=nodes,
-                    links=links,
-                    point_ids=list(panel.point_ids),
-                )
-            )
-    return plan
+# 同一服务进程内的搜索登记表；进程重启后编号失效。
+_searches: dict[str, _SearchState] = {}
+_searches_lock = threading.Lock()
+_SEARCH_TTL_SECONDS = 3600.0
+_MAX_SEARCHES = 512
 
 
-def _reachable_points(req: SolveRequest, choices: list[str]) -> tuple[list, list]:
-    """对成功方案再跑一次连通分析，返回可达/不可达必达展点。"""
-    # 复用求解器内部 DSU：重新构造并一次性放置全部板。
-    from .solver import _RollbackDSU, _q  # noqa: WPS437
+@dataclass
+class _SearchState:
+    solver: Solver
+    batch_index: int
+    attempted_total: int
+    last_used_at: float
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    dsu = _RollbackDSU()
-    coord_buckets: dict[tuple, list[tuple]] = {}
 
-    for r in range(req.rows):
-        for c in range(req.cols):
-            panel = req.panels[choices[r * req.cols + c]]
-            for n in panel.nodes:
-                dsu.add((r, c, n.id))
-            for lk in panel.links:
-                dsu.union((r, c, lk.a), (r, c, lk.b))
-            for n in panel.nodes:
-                if not n.is_connector:
-                    continue
-                lx, ly = _q(n.position.x), _q(n.position.y)
-                gkey = (_q(c + lx), _q(r + ly))
-                coord_buckets.setdefault(gkey, []).append((r, c, n.id))
-    for bucket in coord_buckets.values():
-        first = bucket[0]
-        for other in bucket[1:]:
-            dsu.union(first, other)
+def _prune_registry(now: float) -> None:
+    stale = [
+        sid
+        for sid, st in _searches.items()
+        if now - st.last_used_at > _SEARCH_TTL_SECONDS
+    ]
+    for sid in stale:
+        _searches.pop(sid, None)
+    if len(_searches) > _MAX_SEARCHES:
+        oldest = sorted(_searches, key=lambda sid: _searches[sid].last_used_at)
+        for sid in oldest[: len(_searches) - _MAX_SEARCHES]:
+            _searches.pop(sid, None)
 
-    # 入口节点。
-    ex, ey = _q(req.entrance.x), _q(req.entrance.y)
-    ent_roots = {dsu.find(k) for k in coord_buckets.get((ex, ey), [])}
 
-    reachable, unreachable = [], []
-    for p in req.must_reach:
-        r = min(max(int(p.y), 0), req.rows - 1)
-        c = min(max(int(p.x), 0), req.cols - 1)
-        lx, ly = _q(p.x - c), _q(p.y - r)
-        panel = req.panels[choices[r * req.cols + c]]
-        node_key = None
-        for n in panel.nodes:
-            if n.id in panel.point_ids and (
-                _q(n.position.x), _q(n.position.y)
-            ) == (lx, ly):
-                node_key = (r, c, n.id)
-                break
-        if node_key is not None and dsu.find(node_key) in ent_roots:
-            reachable.append(_round_pos(p.x, p.y))
-        else:
-            unreachable.append(_round_pos(p.x, p.y))
-    return reachable, unreachable
+def _batch_payload(state: _SearchState, search_id: str, used: int) -> BatchResponse:
+    solver = state.solver
+    state.batch_index += 1
+    state.attempted_total += used
+
+    done = solver.done
+    if done:
+        status = "optimal" if solver.best_choices is not None else "infeasible"
+    else:
+        status = "searching"
+
+    best_plan = None
+    if solver.best_choices is not None:
+        best_plan = BatchPlan(
+            total_cost=round(float(solver.best_cost or 0.0), 2),
+            plan=build_plan(solver.req, solver.best_choices),
+        )
+
+    return BatchResponse(
+        search_id=search_id,
+        batch_index=state.batch_index,
+        status=status,
+        attempts_used=used,
+        pending_branches=0 if done else solver.pending_branches,
+        attempted_total=state.attempted_total,
+        current_min_cost=(
+            round(float(solver.best_cost), 2)
+            if solver.best_cost is not None
+            else None
+        ),
+        best_plan=best_plan,
+        cost_lower_bound=None if done else solver.lower_bound(),
+        reason=(
+            solver.result()["reason"]
+            if done and solver.best_choices is None
+            else None
+        ),
+        entrance=solver.req.entrance,
+        must_reach=list(solver.req.must_reach),
+    )
+
+
+def _get_state(search_id: str) -> _SearchState:
+    with _searches_lock:
+        _prune_registry(time.monotonic())
+        state = _searches.get(search_id)
+    if state is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"搜索编号 {search_id} 不存在或已过期；"
+                "请重新调用 /api/batch/start 发起（编号仅在当前服务进程内有效）"
+            ),
+        )
+    return state
+
+
+def _advance(state: _SearchState, search_id: str, max_attempts: int) -> BatchResponse:
+    """在锁内推进一批，避免同一编号的并发续算把栈状态打乱。
+
+    锁按搜索编号分配，不同搜索可并行推进。
+    """
+    with state.lock:
+        used = state.solver.run_batch(max_attempts)
+        state.last_used_at = time.monotonic()
+        return _batch_payload(state, search_id, used)
 
 
 @app.get("/health", tags=["系统"])
@@ -127,42 +145,87 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/solve", response_model=SolveResponse, tags=["换板试算"])
+@app.post(
+    "/api/solve",
+    response_model=SolveResponse,
+    tags=["换板试算"],
+    summary="一次算完：求最低价方案",
+)
 def solve(req: SolveRequest) -> Any:
     solver = Solver(req)
     result = solver.solve()
 
     if not result["feasible"]:
-        reachable, unreachable = [], []
+        reach, unreach = [], []
         # 若存在走到叶节点的完整组合（如仅因展点不可达而失败），
         # 回显其连通分析，便于前端在图面上标注。
         if result.get("last_leaf_choices") is not None:
-            reachable, unreachable = _reachable_points(
-                req, result["last_leaf_choices"]
-            )
+            reach, unreach = reachable_points(req, result["last_leaf_choices"])
         return SolveResponse(
             feasible=False,
             reason=result["reason"],
             entrance=req.entrance,
             must_reach=list(req.must_reach),
-            reachable_points=reachable,
-            unreachable_points=unreachable,
+            reachable_points=reach,
+            unreachable_points=unreach,
             diagnostics=result["stats"],
         )
 
     choices = result["choices"]
-    plan = _build_plan(req, choices)
-    reachable, unreachable = _reachable_points(req, choices)
+    reach, unreach = reachable_points(req, choices)
     return SolveResponse(
         feasible=True,
         total_cost=round(float(result["total_cost"]), 2),
         entrance=req.entrance,
         must_reach=list(req.must_reach),
-        reachable_points=reachable,
-        unreachable_points=unreachable,
-        plan=plan,
+        reachable_points=reach,
+        unreachable_points=unreach,
+        plan=build_plan(req, choices),
         diagnostics=result["stats"],
     )
+
+
+@app.post(
+    "/api/batch/start",
+    response_model=BatchResponse,
+    tags=["分批续算"],
+    summary="发起分批搜索（同时跑完第一批）",
+    description=(
+        "请求体为原试算输入再加 `max_attempts`（本批最多试放次数）。"
+        "返回 `search_id`，后续用 `POST /api/batch/{search_id}` 续算；"
+        "每个候选分支只会在某一批里试一次。"
+        "示例中 `max_attempts=1`，即发起批也只试一个选择。"
+    ),
+)
+def batch_start(req: BatchRequest) -> BatchResponse:
+    solver = Solver(req)
+    search_id = uuid.uuid4().hex
+    state = _SearchState(
+        solver=solver,
+        batch_index=0,
+        attempted_total=0,
+        last_used_at=time.monotonic(),
+    )
+    with _searches_lock:
+        _prune_registry(state.last_used_at)
+        _searches[search_id] = state
+    return _advance(state, search_id, req.max_attempts)
+
+
+@app.post(
+    "/api/batch/{search_id}",
+    response_model=BatchResponse,
+    tags=["分批续算"],
+    summary="凭编号续算一批",
+    description=(
+        "沿用发起时的试算输入，从上次停下的位置继续；"
+        "已经试过的候选不会重试。每批最多试放 `max_attempts` 次，"
+        "返回本批实际次数。示例中 `max_attempts=1`，即每批只试一个选择。"
+    ),
+)
+def batch_resume(search_id: str, req: ResumeRequest) -> BatchResponse:
+    state = _get_state(search_id)
+    return _advance(state, search_id, req.max_attempts)
 
 
 @app.exception_handler(Exception)
